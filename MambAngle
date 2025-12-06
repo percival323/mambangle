@@ -1,0 +1,142 @@
+from __future__ import print_function, division
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from mamba_ssm import Mamba
+
+def Conv1d(in_channels, out_channels, kernel_size, r=0):
+    conv = nn.Conv1d(in_channels, out_channels, kernel_size, padding=(kernel_size - 1) // 2, bias=False)
+
+    return conv
+
+
+def Linear(in_channels, out_channels, r=0):
+    linear = nn.Linear(in_channels, out_channels, bias=False)
+
+    return linear
+
+
+class MAConv1d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, r=0):
+        super(MAConv1d, self).__init__()
+        self.conv = Conv1d(in_channels, out_channels, kernel_size, r)
+        self.kernel_size = kernel_size
+        if in_channels != out_channels:
+            self.identity = Conv1d(in_channels, out_channels, 1, r)
+        else:
+            self.identity = nn.Sequential()
+
+    def forward(self, x, masks):
+        x_ = self.identity(x)
+        out = self.conv(x)
+        out = F.hardswish(out)
+        out = out + x_
+        return out
+
+
+
+class MA_block(nn.Module):
+    def __init__(self, MAConv1d,in_channels, out_channels,dropout=0.2,r=0):
+        super(MA_block, self).__init__()
+
+
+        self.conv =MAConv1d(in_channels, out_channels, kernel_size=1)
+
+        self.depth_conv1 = nn.Conv1d(out_channels // 2, out_channels // 2, 3, padding=(3-1)//2,groups=out_channels // 2)
+        self.conv2 = MAConv1d(out_channels // 2, out_channels // 4, kernel_size=1)
+        self.conv3 = MAConv1d(out_channels//4, out_channels// 2, kernel_size=1)
+        self.depth_conv2 = nn.Conv1d(out_channels // 2, out_channels // 2, 3, padding=(3-1)//2,groups=out_channels // 2)
+        self.bn=nn.BatchNorm1d(out_channels // 2)
+        self.relu=nn.ReLU(inplace=True)
+
+        self.branch_dropout = nn.Dropout(dropout)
+        #self.branch_conv =MAConv1d(out_channels//2, out_channels//2, kernel_size=3)
+
+
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x,masks=None):
+        out = self.conv(x,masks)
+        branch1,branch2 = out.chunk(2, dim=1)
+        branch2 = self.branch_dropout(branch2)
+        branch2 = self.depth_conv1(branch2)
+        branch2 = self.conv2(branch2,masks)
+        branch2 = self.conv3(branch2,masks)
+        branch2 = self.depth_conv2(branch2)
+        branch2 = self.bn(branch2)
+        branch2 = self.relu(branch2)
+
+        out=torch.cat([branch1, branch2], 1)
+        out=self.dropout(out)
+        return out
+
+
+
+
+class MA_unit(nn.Module):
+    def __init__(self, BasicConv, in_channels, out_channels, dropout=0.2, r=0):
+        super(MA_unit, self).__init__()
+        self.input_layers = MA_block(BasicConv, in_channels, out_channels // 2, dropout, r)
+        self.intermediate_layer = MA_block(BasicConv, in_channels, out_channels // 2, dropout, r)
+        self.skip=nn.Conv1d(in_channels, out_channels // 2,kernel_size=1)
+
+    def forward(self, x, masks=None):
+        branch1 = self.input_layers(x, masks)
+
+        out = self.intermediate_layer(x, masks)
+        branch2 = self.skip(x)
+        branch2 = out + branch2
+        output = torch.cat([branch1, branch2], 1)
+        return output
+
+
+class MambAngle(nn.Module):
+    def __init__(self, args):
+        super(MambAngle, self).__init__()
+        self.layer1 = MA_unit(MAConv1d, args.input_dim, args.hidden_size, args.dropout, args.r)
+        self.layer2 = nn.ModuleList(
+            [MA_unit(MAConv1d, args.hidden_size, args.hidden_size, args.dropout, args.r) for i in
+             range(args.depth - 1)])
+        self.mamba = Mamba(d_model=args.hidden_size, d_state=args.d_state, d_conv=args.d_conv, expand=args.expand)
+        self.transformer=att_block(args.hidden_size,args.hidden_size)
+        self.bilstm=nn.LSTM(input_size=args.hidden_size,hidden_size=args.hidden_size//2,bidirectional=True,num_layers=2)
+
+        self.bn = nn.BatchNorm1d(args.hidden_size)
+        self.fc1 = Conv1d(args.hidden_size, 512, 1, args.r)
+        if args.degree_transfer:
+            self.fc2 = nn.Conv1d(512, 4, 1, padding=0, bias=False)
+        else:
+            self.fc2 = nn.Conv1d(512, 2, 1, padding=0, bias=False)
+        self.depth = args.depth
+        self.dropout = nn.Dropout(0.5)
+
+    def forward(self, x, masks=None):
+        out = x.transpose(1, 2).contiguous()
+        out = self.dropout(out)
+        out = self.layer1(out, masks)
+        for i in range(self.depth - 1):
+            out = self.layer2[i](out, masks)
+
+
+        out = out.transpose(1, 2).contiguous()
+        #out=self.transformer(out)
+        #out, _ = self.bilstm(out)
+        out = self.mamba(out)
+        out = out.transpose(1, 2).contiguous()
+
+
+        out = self.bn(out, masks)
+        out = F.hardswish(self.fc1(out))
+        out = self.fc2(out)
+        out = out.transpose(1, 2).contiguous()
+        x_feature = out
+        out = F.hardtanh(out, -6, 6) / 6.0
+
+        return out,x_feature
+
+
+
+
+
+
