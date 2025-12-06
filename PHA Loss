@@ -1,0 +1,73 @@
+import torch
+class PHA_Loss(torch.nn.Module):
+    def __init__(self, args,mu=0.5):
+        super(PHA_Loss, self).__init__()
+        self.mu = mu
+
+        self.alpha = args.varloss_alpha
+        self.beta = args.varloss_beta
+    def norm_local(self, tensor):
+        min = tensor.clone().min()
+        max = tensor.clone().max()
+        normalised = ((tensor - min) / (max - min))
+        return normalised
+
+
+    def forward(self, X, targets,x_feature):
+        PHI_targets = targets[:, :, 0]
+        PSI_targets = targets[:, :, 1]
+        PHI_masks = torch.isnan(PHI_targets).logical_not()
+        PSI_masks = torch.isnan(PSI_targets).logical_not()
+        #PHI_pred_sin = torch.masked_select(X[:, :, 0], PHI_masks)
+        # PHI_pred_cos = torch.masked_select(X[:, :, 1], PHI_masks)
+        # PSI_pred_sin = torch.masked_select(X[:, :, 2], PSI_masks)
+        # PSI_pred_cos = torch.masked_select(X[:, :, 3], PSI_masks)
+        PHI_pred_sin = X[:, :, 0]* PHI_masks
+        PHI_pred_cos = X[:, :, 1]* PHI_masks
+        PSI_pred_sin = X[:, :, 2]* PSI_masks
+        PSI_pred_cos = X[:, :, 3]* PSI_masks
+
+
+        with torch.no_grad():
+            #PHI_targets = torch.masked_select(PHI_targets, PHI_masks)
+            PHI_targets = PHI_targets*PHI_masks
+            PHI_targets_rad = torch.deg2rad(180 * PHI_targets)
+            target_PHI_sin = torch.sin(PHI_targets_rad)
+            target_PHI_cos = torch.cos(PHI_targets_rad)
+
+            #PSI_targets = torch.masked_select(PSI_targets, PSI_masks)
+            PSI_targets = PSI_targets* PSI_masks
+            PSI_targets_rad = torch.deg2rad(180 * PSI_targets)
+            target_PSI_sin = torch.sin(PSI_targets_rad)
+            target_PSI_cos = torch.cos(PSI_targets_rad)
+
+        diff_PHI_sin = torch.abs(target_PHI_sin - PHI_pred_sin)
+        diff_PHI_cos = torch.abs(target_PHI_cos - PHI_pred_cos)
+        diff_PSI_sin = torch.abs(target_PSI_sin - PSI_pred_sin)
+        diff_PSI_cos = torch.abs(target_PSI_cos - PSI_pred_cos)
+        #------------------------------------------------------------------------------------
+        features_copy = x_feature.clone().detach()
+        features_dp = features_copy.reshape(features_copy.shape[0], -1)
+        features_dp = (torch.var(features_dp, dim=1))
+        variance_dp_normalised = self.norm_local(features_dp)
+        weights = (torch.exp(variance_dp_normalised * self.alpha) - 1.) + self.beta
+        weights = weights.unsqueeze(1)
+
+
+        diff_PHI_sin = weights * diff_PHI_sin
+        diff_PHI_cos = weights * diff_PHI_cos
+
+        diff_PSI_sin = weights * diff_PSI_sin
+        diff_PSI_cos = weights * diff_PSI_cos
+
+        diff_PHI_sin = torch.masked_select(diff_PHI_sin, PHI_masks).flatten()
+        diff_PHI_cos = torch.masked_select(diff_PHI_cos, PHI_masks).flatten()
+        diff_PSI_sin = torch.masked_select(diff_PSI_sin, PSI_masks).flatten()
+        diff_PSI_cos = torch.masked_select(diff_PSI_cos, PSI_masks).flatten()
+        # ------------------------------------------------------------------------------------
+        loss = self.mu * (diff_PHI_sin + diff_PHI_cos).mean() + (1 - self.mu) * (diff_PSI_sin + diff_PSI_cos).mean()
+        return loss
+
+
+
+
